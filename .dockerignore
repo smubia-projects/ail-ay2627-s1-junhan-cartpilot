@@ -1,8 +1,15 @@
 .git
+.github
 .venv
 .env
+.env.*
 .claude
 .pytest_cache
+.vercel
 __pycache__
 *.pyc
 tests
+static
+original-playwright
+README.md
+requirements-dev.txt
