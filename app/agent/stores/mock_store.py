@@ -1,65 +1,47 @@
-"""Adapter for our 3 mock grocery sites. They share one HTML contract (see mock_stores/server.py),
-so a single adapter class serves all of them; only the slug differs."""
-from urllib.parse import urlparse
+"""Adapter for our 3 mock grocery sites. They live in this process, so the adapter reads their
+catalogue directly (mock_stores/products.py) instead of driving a browser. Each step still "visits"
+the page through VirtualPage (safety guard + log + live tile), rendered from the same templates the
+/stores routes serve. A single adapter class serves all three stores; only the slug differs."""
+from urllib.parse import urlencode, urlparse
 
-from app.agent.safe_page import SafePage, UnexpectedPage
+from app.agent.virtual_page import UnexpectedPage, VirtualPage
 from app.agent.stores.base import StoreAdapter
 from app.models import ProductDetails, SearchHit
-from mock_stores.products import STORES
-
-_CARD_FIELDS = {
-    "product_id": (None, "data-product-id"),
-    "name": ("[data-field=name]", None),
-    "size": ("[data-field=size]", None),
-    "price": ("[data-field=price]", "data-price"),
-    "stock": ("[data-field=stock]", "data-in-stock"),
-    "product_url": ("a.product-link", "href"),
-}
-_DETAIL_FIELDS = {
-    "product_id": (None, "data-product-id"),
-    "name": ("[data-field=name]", None),
-    "brand": ("[data-field=brand]", None),
-    "size": ("[data-field=size]", None),
-    "price": ("[data-field=price]", "data-price"),
-    "stock": ("[data-field=stock]", "data-in-stock"),
-    "description": ("[data-field=description]", None),
-}
+from mock_stores import products as db
+from mock_stores.server import render_html
 
 
 class MockStoreAdapter(StoreAdapter):
     def __init__(self, slug: str, base_url: str):
+        if slug not in db.STORES:
+            raise UnexpectedPage(f"No such store: {slug}")
         self.slug = slug
-        self.name = STORES[slug].name
+        self.name = db.STORES[slug].name
         self.base = base_url.rstrip("/")
         self.allowed_hosts = {urlparse(self.base).hostname}
 
-    async def search(self, page: SafePage, query: str) -> list[SearchHit]:
-        await page.goto(f"{self.base}/stores/{self.slug}/")
-        await page.type_and_search("input[name=q]", query)
-        await page.wait_for(".product-card, .no-results")
-        if await page.exists(".no-results"):
-            return []
-        rows = await page.extract(".product-card", _CARD_FIELDS)
-        try:
-            return [SearchHit(store=self.slug, product_id=r["product_id"], name=r["name"], size=r["size"],
-                              price=float(r["price"]), in_stock=r["stock"] == "true", url=r["product_url"])
-                    for r in rows]
-        except (TypeError, ValueError, KeyError):
-            raise UnexpectedPage(f"{self.name}'s results page didn't look as expected")
+    def _url(self, path: str) -> str:
+        return f"{self.base}/stores/{self.slug}/{path}"
 
-    async def open_product_page(self, page: SafePage, hit: SearchHit) -> None:
-        link = f'.product-card[data-product-id="{hit.product_id}"] a.product-link'
-        if await page.exists(link):  # still on the results page: click like a person would
-            await page.click(link)
-        else:
-            await page.goto(hit.url)
-        await page.wait_for("main[data-product-id]")
+    async def search(self, page: VirtualPage, query: str) -> list[SearchHit]:
+        await page.goto(self._url(""), render_html(self.slug, "search", q="", products=db.featured(self.slug), is_home=True))
+        await page.type_search(query)
+        products = db.search(self.slug, query[:100])
+        await page.goto(self._url("search?" + urlencode({"q": query})),
+                        render_html(self.slug, "search", q=query, products=products, is_home=False))
+        return [SearchHit(store=self.slug, product_id=p.id, name=f"{p.brand} {p.name}", size=p.size, price=p.price,
+                          in_stock=p.in_stock, url=self._url(f"product/{p.id}"))
+                for p in products]
 
-    async def get_product_details(self, page: SafePage, hit: SearchHit) -> ProductDetails:
-        rows = await page.extract("main[data-product-id]", _DETAIL_FIELDS)
-        if not rows:
+    async def open_product_page(self, page: VirtualPage, hit: SearchHit) -> None:
+        p = db.BY_ID.get(hit.product_id)
+        if not p or p.store != self.slug:
             raise UnexpectedPage(f"{self.name}'s product page didn't look as expected")
-        r = rows[0]
-        return ProductDetails(store=self.slug, product_id=r["product_id"], name=r["name"], brand=r["brand"] or "",
-                              size=r["size"], price=float(r["price"]), in_stock=r["stock"] == "true",
-                              description=r["description"] or "", url=page.url)
+        await page.goto(hit.url, render_html(self.slug, "product", p=p, q=""))
+
+    async def get_product_details(self, page: VirtualPage, hit: SearchHit) -> ProductDetails:
+        p = db.BY_ID.get(hit.product_id)
+        if not p or p.store != self.slug:
+            raise UnexpectedPage(f"{self.name}'s product page didn't look as expected")
+        return ProductDetails(store=self.slug, product_id=p.id, name=f"{p.brand} {p.name}", brand=p.brand,
+                              size=p.size, price=p.price, in_stock=p.in_stock, description=p.description, url=page.url)

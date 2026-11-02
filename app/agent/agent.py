@@ -1,23 +1,20 @@
-"""The orchestrator: runs many browser pages in parallel, searching every store for every item.
+"""The orchestrator: runs many agents in parallel, searching every store for every item.
 
-Work is split into small jobs, one per (store, ingredient). A pool of `max_parallel` browser
-pages ("workers") pulls jobs from a queue until it is empty. For each job a worker:
+Work is split into small jobs, one per (store, ingredient). A pool of `max_parallel` agents
+("workers", one VirtualPage each) pulls jobs from a queue until it is empty. For each job a worker:
     search the store  ->  pick a product (the `chooser`)  ->  open its page  ->  read its details
 
 Everything the agent does is reported through the `emit(event: dict)` callback: log lines,
-worker labels, JPEG frames and results. The web layer (step 7) forwards these to the browser.
+worker labels, rendered store pages ("view") and results. The API streams these to the browser
+over SSE. (The original drove real Chromium pages with Playwright; see original-playwright/.)
 """
 import asyncio
-import base64
 import time
 import uuid
 from typing import Callable
 
-from playwright.async_api import TimeoutError as PlaywrightTimeout
-from playwright.async_api import async_playwright
-
 from app import units
-from app.agent.safe_page import AgentStopped, SafePage, UnexpectedPage
+from app.agent.virtual_page import AgentStopped, UnexpectedPage, VirtualPage
 from app.agent.safety import SafetyViolation
 from app.agent.stores.base import StoreAdapter
 from app.models import SearchHit, TaskResult
@@ -58,7 +55,7 @@ class Run:
     def __init__(self, items: list[str], adapters: list[StoreAdapter], *, approved: bool,
                  emit: Emit | None = None, chooser: Chooser = first_in_stock,
                  enricher: Callable[[TaskResult], None] | None = None, max_parallel: int = 4,
-                 headless: bool = True, fps: float = 2.0, viewport: tuple[int, int] = (900, 600)):
+                 delay_range: tuple[float, float] | None = None):
         self.id = uuid.uuid4().hex[:8]
         self.items = items
         self.adapters = {a.slug: a for a in adapters}
@@ -66,9 +63,7 @@ class Run:
         self.chooser = chooser
         self.enricher = enricher  # called on every finished result, e.g. to attach ranked options
         self.max_parallel = max(1, max_parallel)
-        self.headless = headless
-        self.fps = fps
-        self.viewport = viewport
+        self.delay_range = delay_range  # overrides each store's delay (tests use (0, 0))
         self._emit_cb = emit
 
         self.state = "pending"  # pending -> running -> finished | stopped | failed
@@ -127,56 +122,38 @@ class Run:
         n_workers = min(self.max_parallel, queue.qsize())
         self.emit({"type": "run_started", "items": self.items, "stores": {s: a.name for s, a in self.adapters.items()},
                    "workers": n_workers})
-        browser = pw = None
         try:
-            pw = await async_playwright().start()
-            browser = await pw.chromium.launch(headless=self.headless)
-            await asyncio.gather(*(self._worker(i, queue, browser) for i in range(n_workers)))
+            await asyncio.gather(*(self._worker(i, queue) for i in range(n_workers)))
             self.state = "finished"
             self.emit({"type": "run_finished", "results": len(self.results)})
         except (asyncio.CancelledError, AgentStopped):
             self.state = "stopped"
             self.emit({"type": "run_stopped"})
-        except Exception as e:  # e.g. Chromium not installed
+        except Exception as e:
             self.state = "failed"
-            self.emit({"type": "run_failed", "message": f"Couldn't start the browser agent: {e}"})
-        finally:
-            # Closing the browser kills every page, even ones in the middle of an action.
-            for closer in (browser and browser.close, pw and pw.stop):
-                if closer:
-                    try:
-                        await asyncio.shield(closer())
-                    except BaseException:
-                        pass
+            self.emit({"type": "run_failed", "message": f"The search agents stopped unexpectedly: {e}"})
 
-    async def _worker(self, wid: int, queue: asyncio.Queue, browser):
+    async def _worker(self, wid: int, queue: asyncio.Queue):
         allowed = set().union(*(a.allowed_hosts for a in self.adapters.values()))
-        context = await browser.new_context(viewport={"width": self.viewport[0], "height": self.viewport[1]},
-                                            locale="en-SG")
-        sp = await SafePage.open(context, wid, allowed, self.stop_event, lambda *a, **k: self._action(wid, *a, **k))
-        caster = asyncio.create_task(self._screencast(wid, sp))
+        sp = VirtualPage(wid, allowed, self.stop_event, lambda *a, **k: self._action(wid, *a, **k),
+                         lambda url, html: self.emit({"type": "view", "worker": wid, "url": url, "html": html}))
         self._set_worker(wid, None, "Ready")
-        try:
-            while True:
-                try:
-                    adapter, ingredient = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                sp.delay_range = adapter.delay_range
-                async with self._store_locks[adapter.slug]:
-                    result = await self._do_job(wid, sp, adapter, ingredient)
-                if self.enricher:
-                    self.enricher(result)
-                self.results.append(result)
-                self.emit({"type": "result", "result": result.model_dump()})
-            self._set_worker(wid, None, "Done")
-            await self._send_frame(wid, sp)  # last picture, so the tile shows the final page
-        finally:
-            caster.cancel()
-            await sp.close()
+        while True:
+            try:
+                adapter, ingredient = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            sp.delay_range = self.delay_range or adapter.delay_range
+            async with self._store_locks[adapter.slug]:
+                result = await self._do_job(wid, sp, adapter, ingredient)
+            if self.enricher:
+                self.enricher(result)
+            self.results.append(result)
+            self.emit({"type": "result", "result": result.model_dump()})
+        self._set_worker(wid, None, "Done")
 
     # ------------------------------------------------------------ one job
-    async def _do_job(self, wid: int, sp: SafePage, adapter: StoreAdapter, ingredient: str) -> TaskResult:
+    async def _do_job(self, wid: int, sp: VirtualPage, adapter: StoreAdapter, ingredient: str) -> TaskResult:
         base = dict(store=adapter.slug, ingredient=ingredient)
         if adapter.slug in self.failed_stores:
             return TaskResult(**base, status="skipped", message=f"Skipped: {self.failed_stores[adapter.slug]}")
@@ -185,7 +162,7 @@ class Run:
             hits, used = [], ""
             for query in queries_for(ingredient):
                 used = query
-                hits = await self._with_retry(adapter.search, sp, query)
+                hits = await adapter.search(sp, query)
                 self._action(wid, "found", f"{len(hits)} result(s) for {query!r}")
                 if hits:
                     break
@@ -203,46 +180,18 @@ class Run:
             return TaskResult(**base, status="found", query_used=used, hits=hits, chosen=details)
         except (AgentStopped, asyncio.CancelledError):
             raise
-        except SafetyViolation as e:  # already logged by SafePage; this item is skipped, run continues
+        except SafetyViolation as e:  # already logged by VirtualPage; this item is skipped, run continues
             return TaskResult(**base, status="blocked", message=e.reason)
-        except UnexpectedPage as e:  # blocked / CAPTCHA / layout changed: abandon this whole store
+        except UnexpectedPage as e:  # unknown store / product missing: abandon this whole store
             self.failed_stores[adapter.slug] = str(e)
             self._action(wid, "stop-store", f"{adapter.name}: {e}", "error")
             return TaskResult(**base, status="error", message=f"{e}. Stopped searching {adapter.name}.")
-        except PlaywrightTimeout:
-            self._action(wid, "timeout", f"{adapter.name} took too long", "error")
-            return TaskResult(**base, status="error", message=f"{adapter.name} was too slow to respond.")
         except Exception as e:
             self._action(wid, "error", f"{type(e).__name__}: {e}", "error")
             return TaskResult(**base, status="error", message=f"Something went wrong searching {adapter.name}.")
 
-    async def _with_retry(self, fn, sp, arg):
-        """Run an adapter call; retry once on a timeout (a slow page load is usually a blip)."""
-        try:
-            return await fn(sp, arg)
-        except PlaywrightTimeout:
-            self._action(sp.worker, "retry", "timed out, trying once more", "error")
-            return await fn(sp, arg)
-
-    # ------------------------------------------------------------ logging + live frames
+    # ------------------------------------------------------------ logging
     def _action(self, wid: int, action: str, detail: str = "", status: str = "ok"):
         """Every action the agent takes goes through here: it becomes a log line in the UI."""
         store = self.workers.get(wid, {}).get("store")
         self.emit({"type": "log", "worker": wid, "store": store, "action": action, "detail": detail, "status": status})
-
-    async def _send_frame(self, wid: int, sp: SafePage, last: list | None = None):
-        try:
-            jpeg = await sp.screenshot()
-        except Exception:
-            return  # page was mid-navigation or closing: just skip this frame
-        if last is not None:
-            if last and last[0] == jpeg:
-                return  # nothing changed; don't resend the same picture
-            last[:] = [jpeg]
-        self.emit({"type": "frame", "worker": wid, "data": base64.b64encode(jpeg).decode()})
-
-    async def _screencast(self, wid: int, sp: SafePage):
-        last: list = []
-        while True:
-            await asyncio.sleep(1 / self.fps)
-            await self._send_frame(wid, sp, last)
