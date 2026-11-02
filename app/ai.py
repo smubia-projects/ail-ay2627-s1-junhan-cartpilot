@@ -1,14 +1,17 @@
-"""All Gemini calls live here. Later steps add fridge scan, product matching, leftovers.
+"""All AI calls live here: recipes, ingredients, fridge scan, match review, leftover ideas.
 
-Pattern for every call:  prompt -> Gemini in JSON mode -> validate with Pydantic.
-In DEMO_MODE we skip the network and return canned data instead.
+Pattern for every call:  prompt -> an OpenAI-compatible chat model in JSON mode -> validate with Pydantic.
+The gateway and models come from env (API_BASE_URL, MODEL_NAME, VISION_MODEL_NAME); the original
+used the google-genai SDK directly.
+In DEMO_MODE we skip the network and return canned data instead (local development only).
 """
 import asyncio
+import base64
+import json
 import logging
 import re
 
-from google import genai
-from google.genai import types
+from openai import APIConnectionError, APIStatusError, AsyncOpenAI
 from pydantic import BaseModel, ValidationError
 
 from app import config
@@ -25,65 +28,77 @@ class AIError(Exception):
     """An error with a message that is safe and friendly to show the user.
 
     `status` is the HTTP code the API route should answer with
-    (503 = AI service problem, 400 = the user's input was bad).
+    (502 = the AI provider failed, 501 = AI not configured, 400 = the user's input was bad).
+    503 is reserved for the AI Lodge kill switch.
     """
 
-    def __init__(self, message: str, status: int = 503):
+    def __init__(self, message: str, status: int = 502):
         super().__init__(message)
         self.status = status
 
 
-_client: genai.Client | None = None
+_client: AsyncOpenAI | None = None
 
 
-def _get_client() -> genai.Client:
+def _get_client() -> AsyncOpenAI:
     global _client
-    if not config.GEMINI_API_KEY:
-        raise AIError("No GEMINI_API_KEY set. Add it to .env, or set DEMO_MODE=true.")
+    if not config.API_KEY:
+        raise AIError("The AI is not configured on this server (no API_KEY).", status=501)
     if _client is None:
-        _client = genai.Client(api_key=config.GEMINI_API_KEY)
+        _client = AsyncOpenAI(api_key=config.API_KEY, base_url=config.API_BASE_URL, max_retries=0, timeout=60)
     return _client
 
 
+def _strip_fences(text: str) -> str:
+    """Some models wrap JSON in ```json fences even in JSON mode."""
+    m = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
+    return (m.group(1) if m else text).strip()
+
+
 async def call_json(prompt: str, schema: type[BaseModel], image: bytes | None = None) -> BaseModel:
-    """Ask Gemini for JSON matching `schema`; retry (up to 3 tries) if the JSON is invalid or the service is busy."""
+    """Ask the model for JSON matching `schema`; retry (up to 3 tries) if the JSON is invalid or the service is busy."""
     client = _get_client()
-    # With an image, Gemini takes a list: the picture first, then the instructions.
-    contents = [types.Part.from_bytes(data=image, mime_type="image/jpeg"), prompt] if image else prompt
+    system = ("Reply with a single JSON object only, no prose, that validates against this JSON Schema:\n"
+              + json.dumps(schema.model_json_schema()))
+    if image:  # with an image the user message is a list: the picture first, then the instructions
+        data_url = "data:image/jpeg;base64," + base64.b64encode(image).decode()
+        content = [{"type": "image_url", "image_url": {"url": data_url}}, {"type": "text", "text": prompt}]
+    else:
+        content = prompt
+    model = config.VISION_MODEL_NAME if image else config.MODEL_NAME
     for attempt in (1, 2, 3):
-        resp = None
+        text = None
         try:
-            resp = await client.aio.models.generate_content(
-                model=config.GEMINI_MODEL,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",  # "JSON mode"
-                    response_schema=schema,
-                    temperature=0.4,
-                ),
+            resp = await client.chat.completions.create(
+                model=model,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": content}],
+                response_format={"type": "json_object"},  # "JSON mode"
+                temperature=0.4,
             )
-            return schema.model_validate_json(resp.text)
+            text = resp.choices[0].message.content or ""
+            return schema.model_validate_json(_strip_fences(text))
         except ValidationError as e:
-            log.error("Gemini JSON failed validation (attempt %d): %s | raw: %.500s", attempt, e, resp.text if resp else "(no response: schema problem)")
-            if resp is None:
-                raise AIError("Internal error building the AI request.")  # our bug, retrying won't help
+            log.error("Model JSON failed validation (attempt %d): %s | raw: %.500s", attempt, e, text)
             if attempt == 3:
                 raise AIError("The AI gave an unreadable answer. Please try again.")
-        except Exception as e:  # network, quota, bad key...
-            log.error("Gemini call failed (%s): %s", type(e).__name__, e)  # full detail goes to the server log
-            msg = str(e)
-            if ("503" in msg or "UNAVAILABLE" in msg) and attempt < 3:
-                await asyncio.sleep(2 * attempt)  # Google is briefly overloaded: wait and retry
+        except APIStatusError as e:  # the gateway answered with an error
+            log.error("AI call failed (%s): %s", e.status_code, e.message)  # full detail goes to the server log
+            if e.status_code in (500, 502, 503, 504) and attempt < 3:
+                await asyncio.sleep(2 * attempt)  # provider briefly overloaded: wait and retry
                 continue
-            if "503" in msg or "UNAVAILABLE" in msg:
-                raise AIError("The AI service is busy right now. Try again in a moment, or use DEMO_MODE.")
-            if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-                raise AIError("AI rate limit reached (free tier). Wait a minute or turn on DEMO_MODE.")
-            if "API key" in msg or "API_KEY" in msg or "401" in msg or "403" in msg or "PERMISSION_DENIED" in msg:
-                raise AIError("Gemini rejected the API key. Check GEMINI_API_KEY in .env.")
-            if "404" in msg or "NOT_FOUND" in msg:
-                raise AIError(f"Model '{config.GEMINI_MODEL}' not found. Check GEMINI_MODEL in .env.")
-            raise AIError("Couldn't reach the AI service. Check your connection, or use DEMO_MODE.")
+            if e.status_code in (401, 403):
+                raise AIError("The AI service rejected this server's key.")
+            if e.status_code == 404:
+                raise AIError(f"Model '{model}' was not found on the AI gateway.")
+            if e.status_code == 429:
+                raise AIError("The AI service is busy right now. Try again in a moment.")
+            raise AIError("The AI service had a problem. Please try again.")
+        except APIConnectionError as e:
+            log.error("AI call failed (connection): %s", e)
+            if attempt < 3:
+                await asyncio.sleep(2 * attempt)
+                continue
+            raise AIError("Couldn't reach the AI service. Please try again.")
     raise AIError("AI call failed.")  # unreachable, keeps type-checkers happy
 
 

@@ -1,5 +1,5 @@
 """Pydantic schemas. Every AI response is validated against these,
-so a malformed reply from Gemini becomes a clean error instead of a crash."""
+so a malformed reply from the model becomes a clean error instead of a crash."""
 from typing import Literal
 
 from pydantic import BaseModel, Field

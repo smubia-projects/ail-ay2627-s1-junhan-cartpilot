@@ -87,7 +87,7 @@ def test_clean_steps_keeps_real_quantities():
 
 async def test_missing_key_gives_friendly_error(monkeypatch):
     monkeypatch.setattr(config, "DEMO_MODE", False)
-    monkeypatch.setattr(config, "GEMINI_API_KEY", "")
+    monkeypatch.setattr(config, "API_KEY", "")
     with pytest.raises(ai.AIError):
         await ai.suggest_recipes("cake", 4)
 
