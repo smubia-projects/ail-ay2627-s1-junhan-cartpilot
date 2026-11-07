@@ -8,7 +8,7 @@ const PROJECT_CTA = {
   accentColor: '#4f46e5',
   headline: 'Basket full!',
   description:
-    'You used this demo {count} times: AI agents planned the recipe and compared three stores for you. Want to build AI agents that do real errands? Join us and build projects like this.',
+    'Want to build AI agents that run your errands and find the best price at every store? AI Lodge hands you a team, a deadline and a stage, and you bring the build.',
   programme: 'AI Lodge',
   programmeLink: 'https://www.smubia.com/ailodge',
   showcaseLink: 'https://www.smubia.com/Projects',
