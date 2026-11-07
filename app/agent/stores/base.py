@@ -6,7 +6,7 @@ implement this, so the same agent logic runs on both.
 """
 from abc import ABC, abstractmethod
 
-from app.agent.safe_page import SafePage
+from app.agent.virtual_page import VirtualPage
 from app.models import ProductDetails, SearchHit
 
 
@@ -18,16 +18,16 @@ class StoreAdapter(ABC):
     max_concurrency: int = 99  # max pages on this store at once (real stores use 1-2)
 
     @abstractmethod
-    async def search(self, page: SafePage, query: str) -> list[SearchHit]:
+    async def search(self, page: VirtualPage, query: str) -> list[SearchHit]:
         """Search the store for `query`; return the products on the results page (maybe empty).
 
         Raise UnexpectedPage if the page is blocked / a CAPTCHA / not what we expected.
         """
 
     @abstractmethod
-    async def open_product_page(self, page: SafePage, hit: SearchHit) -> None:
+    async def open_product_page(self, page: VirtualPage, hit: SearchHit) -> None:
         """Open the product page for a search hit (never add to cart)."""
 
     @abstractmethod
-    async def get_product_details(self, page: SafePage, hit: SearchHit) -> ProductDetails:
+    async def get_product_details(self, page: VirtualPage, hit: SearchHit) -> ProductDetails:
         """Read the details from the product page that is currently open."""

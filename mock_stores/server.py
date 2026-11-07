@@ -67,3 +67,8 @@ def product(request: Request, slug: str, product_id: str):
     if not p or p.store != slug:
         raise HTTPException(status_code=404, detail="Product not found")
     return _render(request, slug, "product", p=p, q="")
+
+
+def render_html(slug: str, page: str, **ctx) -> str:
+    """The same page as HTML text, for the in-process agents' live tiles (no HTTP request)."""
+    return TEMPLATES.env.get_template(f"{slug}/{page}.html").render(store=_store(slug), stores=db.STORES.values(), **ctx)
