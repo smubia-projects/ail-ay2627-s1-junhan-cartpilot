@@ -4,6 +4,30 @@
 
 Hackathon track: **Daily Life**.
 
+> **AI Lodge showcase.** This fork is deployed as a public demo by the SMU BIA AI Lodge. What is deployed:
+>
+> * **API** (`app/`, `mock_stores/`): FastAPI on Google Cloud Run, API-only. The three mock stores are served from the
+>   same service at `/stores/...`, because the results link to their product pages.
+> * **UI** (`static/`): the same plain HTML/CSS/JS on Vercel; `build.js` writes `static/config.js` with the API URL
+>   from `VITE_API_BASE`.
+>
+> What changed for the showcase:
+>
+> * **No Playwright.** Headless Chromium is too heavy for the demo backend, so the agents read the mock stores
+>   in-process. Each step still goes through a guard (`app/agent/virtual_page.py`: Stop check, the same URL safety
+>   rules, a log line) and the live grid shows the store page each agent is reading, rendered from the stores' own
+>   templates in a sandboxed frame instead of a screenshot. The original Playwright code, tests and deploy files are
+>   kept in `original-playwright/` (not deployed).
+> * **One run per visitor.** "Approve & start searching" opens one streaming request (Server-Sent Events) and the run
+>   lives inside it; **Stop** closes the stream. There is no shared global run and no WebSocket.
+> * **AI through any OpenAI-compatible gateway** (`API_BASE_URL`, `API_KEY`, `MODEL_NAME`, `VISION_MODEL_NAME`),
+>   in JSON mode with the same Pydantic validation. The Gemini SDK is no longer used.
+> * **AI Lodge rate limit** on every model call (recipes, ingredients, leftover ideas, fridge scan, and each search run,
+>   which ends with the AI match double-check). Over the limit the app shows the AI Lodge card and the AI step stops.
+>   Leftover recipe ideas are now asked for with a button instead of automatically.
+> * `DEMO_MODE` (canned answers) stays for local development and is off in the deployment.
+
+
 ---
 
 ## 1. Problem Statement
@@ -142,58 +166,60 @@ AI is used in **five places**, all through Google Gemini (default model `gemini-
 
 ## 6. Installation & Setup
 
-**Requirements:** Python 3 (tested on 3.14, macOS), `pip`, and about 100 MB of disk space for the Chromium browser used by Playwright. A Gemini API key is optional, because demo mode needs none.
+**Requirements:** Python 3.12+ and `pip`. An AI key is optional, because demo mode needs none.
 
 ```bash
 # 1. get the code and enter the project folder
-git clone <your-repo-url> cartpilot
+git clone https://github.com/smubia-projects/ail-ay2627-s1-junhan-cartpilot cartpilot
 cd cartpilot
 
 # 2. create a virtual environment and install dependencies
 python3 -m venv .venv
 source .venv/bin/activate            # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 
-# 3. download the browser Playwright will control (one time)
-python -m playwright install chromium
-
-# 4. create your settings file
+# 3. create your settings file (set DEMO_MODE=true to run without a key)
 cp .env.example .env                 # Windows: copy .env.example .env
 
-# 5. start the app
-uvicorn app.main:app --reload
+# 4. start the API
+uvicorn app.main:app --reload --port 8000
+
+# 5. in a second terminal, build and serve the UI
+node build.js                        # writes static/config.js -> http://localhost:8000
+python -m http.server 5173 -d static
 ```
 
-Open **<http://127.0.0.1:8000>**. The badge at the top says "Demo mode" until you turn on real AI.
+Open **<http://localhost:5173>**. The badge at the top says "Demo mode" until you turn on real AI.
 
-**To use the real Gemini AI:** get a free key at <https://aistudio.google.com/apikey>, then in `.env` set `GEMINI_API_KEY=<your key>` and `DEMO_MODE=false`, and restart. **Never put your key in `.env.example` or commit it.** (`.env` is git-ignored.)
+**To use real AI:** set `API_KEY` (any OpenAI-compatible gateway; set `API_BASE_URL` to match) and `DEMO_MODE=false`,
+and restart. **Never put your key in `.env.example` or commit it.** (`.env` is git-ignored.)
 
 ### Settings (`.env`)
 
 | Variable | Default | What it does |
 |---|---|---|
-| `GEMINI_API_KEY` | – | Your key. Not needed in demo mode. |
-| `GEMINI_MODEL` | `gemini-3.5-flash-lite` | Model name. Google retires models over time; if you get "model not found", pick another from AI Studio. |
-| `DEMO_MODE` | `true` | `true` = canned AI answers, works offline. `false` = real Gemini. |
+| `API_BASE_URL` | `https://api.apiyi.com/v1` | OpenAI-compatible chat-completions gateway. |
+| `API_KEY` | – | Your key (old name `GEMINI_API_KEY` still works). Not needed in demo mode. |
+| `MODEL_NAME` | `deepseek-v4-flash` | Text model (old name `GEMINI_MODEL` still works). |
+| `VISION_MODEL_NAME` | `gemini-3.5-flash-lite` | Model for the fridge-photo scan (needs vision). |
+| `DEMO_MODE` | `false` | `true` = canned AI answers, works offline (local development). |
 | `STORE_MODE` | `mock` | Only `mock` (the three built-in fake stores) is supported. |
-| `HEADLESS` | `true` | `false` also pops up real browser windows while agents search. |
-| `MAX_PARALLEL` | `4` | How many browser pages work at once. |
-| `SCREENSHOT_FPS` | `2` | Live screenshots per second per tile. |
+| `MAX_PARALLEL` | `4` | How many agents work at once in one run. |
+| `CORS_ORIGINS` | `http://localhost:5173` | Browser origins allowed to call the API (the Vercel URL in production). |
+| `RATE_LIMIT_*` | see `.env.example` | AI Lodge rate-limit fallbacks (the central control sheet overrides them). |
 
 ### Run the tests
 
 ```bash
-python -m pytest -q                        # everything, ~80 s (drives real headless Chromium)
+python -m pytest -q                        # everything, a few seconds (no browser, canned AI)
 python -m pytest tests/test_safety.py -q   # just the safety guard (instant)
 ```
 
-Watch the agents without the web page: `python scripts/watch_agent.py` (opens real browser windows).
-
 ### Troubleshooting
 
-* **"Model … not found"** → change `GEMINI_MODEL` in `.env`.
-* **"AI service is busy" / rate limit** → free-tier hiccup. Wait a few seconds, or set `DEMO_MODE=true`.
-* **Browser agents won't start** → run `python -m playwright install chromium`.
+* **"Model … was not found"** → change `MODEL_NAME` in `.env`.
+* **"AI service is busy"** → provider hiccup. Wait a few seconds, or set `DEMO_MODE=true`.
+* **"Can't reach the server."** in the UI → the API isn't running, or `static/config.js` points elsewhere (`node build.js`).
 * **Anything else** → the real error is printed in the terminal running `uvicorn`.
 
 ---
