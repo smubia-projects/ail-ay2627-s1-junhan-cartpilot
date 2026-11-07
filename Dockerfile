@@ -1,22 +1,22 @@
+# API-only backend for Cloud Run. The UI (static/) is deployed on Vercel; the original Playwright
+# image (Chromium) is kept in original-playwright/Dockerfile and is not built.
 FROM python:3.12-slim
 
-# Browsers live outside any home dir so the non-root runtime user can read them
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
-    && python -m playwright install --with-deps chromium
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Hugging Face Spaces runs containers as uid 1000
-RUN useradd -m -u 1000 user
-COPY --chown=user . .
-USER user
+COPY app/ app/
+COPY mock_stores/ mock_stores/
 
-ENV HOST=0.0.0.0 HEADLESS=true
-EXPOSE 7860
+RUN useradd --create-home --uid 1000 appuser
+USER appuser
 
-# Hugging Face uses 7860; Render injects $PORT. --proxy-headers makes request.base_url
-# use https:// behind the host's proxy, which the store URLs are built from.
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-7860} --proxy-headers --forwarded-allow-ips='*'"]
+EXPOSE 8080
+
+# --proxy-headers makes request.base_url use https:// behind Cloud Run's front end; the agents'
+# product links are built from it.
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080} --proxy-headers --forwarded-allow-ips='*'"]
