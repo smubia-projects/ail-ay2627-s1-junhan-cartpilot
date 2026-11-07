@@ -1,4 +1,4 @@
-// CartPilot front end: plain JavaScript, no build step.
+// CartPilot front end: plain JavaScript. The only build step writes config.js (the API's URL, see build.js).
 // Flow: goal -> recipes -> ingredients -> fridge scan -> checklist -> [Approve] -> live search -> results -> leftovers.
 
 // ---------------------------------------------------------------- state + helpers
@@ -9,7 +9,7 @@ const state = {
   have: {},                   // name -> true if the user owns it
   flags: {},                  // name -> {confidence, note} from the fridge scan
   // live search
-  ws: null, live: false, storeNames: {}, tiles: {}, storeTotals: {}, storeDone: {}, storeLow: {}, jobs: 0, done: 0,
+  abort: null, live: false, storeNames: {}, tiles: {}, storeTotals: {}, storeDone: {}, storeLow: {}, jobs: 0, done: 0,
   // results
   report: null, pick: {}, confirmed: {}, leftoverNames: [],
 };
@@ -55,14 +55,30 @@ function renderMethod(boxId) {
   box.append(details);
 }
 
+// The API runs on its own server (Cloud Run); config.js sets its address at build time.
+const API = (window.CARTPILOT_API_BASE || "http://localhost:8000").replace(/\/+$/, "");
+
+// AI Lodge limit: 429 = this visitor reached the demo's limit (CTA), 503 = the demo is paused.
+// The AI step stops there; there is no substitute answer.
+class LimitError extends Error {}
+async function checkLimit(r) {
+  if (r.status !== 429 && r.status !== 503) return;
+  const data = await r.json().catch(() => ({}));
+  const d = data.detail || {};
+  if (r.status === 429) showRateLimitCTA(d.queries_used || "a few");
+  else showDemoPaused(d.message);
+  throw new LimitError(r.status === 429 ? "You've reached this demo's AI limit." : "The demo is paused right now.");
+}
+
 async function post(url, body) {
-  const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const r = await fetch(API + url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  await checkLimit(r);
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(typeof data.detail === "string" ? data.detail : "Something went wrong. Please check your input.");
   return data;
 }
 
-fetch("/api/health").then(r => r.json()).then(h => {
+fetch(API + "/api/health").then(r => r.json()).then(h => {
   const b = $("mode-badge");
   b.textContent = h.demo_mode ? "Demo mode · sample AI answers, works offline" : `Live AI · ${h.model}`;
   b.className = "badge " + (h.demo_mode ? "warn" : "ok"); b.hidden = false;
@@ -131,7 +147,8 @@ $("scan-btn").addEventListener("click", async () => {
   $("scan-btn").disabled = true;
   $("scan-status").textContent = "Scanning your fridge…"; show("scan-status");
   try {
-    const r = await fetch("/api/fridge-scan", { method: "POST", body: form });
+    const r = await fetch(API + "/api/fridge-scan", { method: "POST", body: form });
+    await checkLimit(r);
     const data = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(typeof data.detail === "string" ? data.detail : "Scan failed. Please try another photo.");
     state.have = {}; state.flags = {};
@@ -179,17 +196,46 @@ $("approve-btn").addEventListener("click", async () => {
   const items = state.ingredients.filter(i => !state.have[i.name]).map(i => ({ name: i.name, quantity: i.quantity, unit: i.unit }));
   if (!items.length) { showError("You already have everything on the list. Nothing to search for!"); return; }
   $("approve-btn").disabled = true;
+  state.items = items;
+  resetLive(); show("step-results", false); show("step-leftovers", false);
+  show("step-live"); $("stop-btn").disabled = false; $("stop-btn").textContent = "⏹ Stop";
+  setStatus("Starting the agents…");
+  scrollTo_("step-live");
+  const ctrl = new AbortController(); state.abort = ctrl;
   try {
     // `approved: true` is only ever sent from this button. The server refuses to start without it.
-    await post("/api/runs", { items, approved: true });
-    state.items = items;
-    resetLive(); show("step-results", false); show("step-leftovers", false);
-    show("step-live"); $("stop-btn").disabled = false; $("stop-btn").textContent = "⏹ Stop";
-    setStatus("Starting the browsers…");
-    connectWS();
-    scrollTo_("step-live");
-  } catch (err) { showError(err.message); $("approve-btn").disabled = false; }
+    // The run lives inside this one streaming request (Server-Sent Events): closing it stops the agents.
+    const r = await fetch(API + "/api/runs/stream", { method: "POST", signal: ctrl.signal,
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ items, approved: true }) });
+    await checkLimit(r);
+    if (!r.ok) {
+      const data = await r.json().catch(() => ({}));
+      throw new Error(typeof data.detail === "string" ? data.detail : "The search couldn't start.");
+    }
+    await readEvents(r.body, handle);
+    if (state.live) endLive("The connection to the search was lost. Please try again.", true);
+  } catch (err) {
+    if (err.name === "AbortError") endLive("Stopped. No more actions will be taken.");
+    else if (err instanceof LimitError) { endLive(err.message); show("step-live", false); }
+    else endLive(err.message, true);
+  }
 });
+
+// Read a text/event-stream body and call `fn` with each `data:` JSON event.
+async function readEvents(body, fn) {
+  const reader = body.pipeThrough(new TextDecoderStream()).getReader();
+  let buf = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) return;
+    buf += value;
+    let i;
+    while ((i = buf.indexOf("\n\n")) >= 0) {
+      const chunk = buf.slice(0, i); buf = buf.slice(i + 2);
+      for (const line of chunk.split("\n")) if (line.startsWith("data: ")) fn(JSON.parse(line.slice(6)));
+    }
+  }
+}
 
 // ---------------------------------------------------------------- 5. live search
 function resetLive() {
@@ -199,20 +245,10 @@ function resetLive() {
 }
 function setStatus(t) { $("live-status").textContent = t; }
 
-function connectWS() {
-  if (state.ws) { state.ws.onclose = null; state.ws.close(); }
-  const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
-  state.ws = ws;
-  ws.onmessage = m => handle(JSON.parse(m.data));
-  // If the connection drops mid-run, reconnect: the server resends a snapshot so nothing is lost.
-  ws.onclose = () => { if (state.live) setTimeout(() => state.live && connectWS(), 1000); };
-}
-
 function handle(e) {
   switch (e.type) {
-    case "snapshot": return applySnapshot(e);
     case "worker": ensureTile(e.worker); setLabel(e.worker, e.store, e.label); break;
-    case "frame": setFrame(e.worker, e.data); break;
+    case "view": setView(e.worker, e.html); break;
     case "log": addLog(e); break;
     case "result": applyResult(e.result); break;
     case "run_started": initStores(e.stores, e.items.length); break;
@@ -221,21 +257,6 @@ function handle(e) {
     case "run_failed": endLive(e.message, true); break;
     case "report": endLive("Done! Here's what I found."); renderReport(e.report); break;
   }
-}
-
-function applySnapshot(s) {
-  if (!s.run) return;
-  resetLive();
-  initStores(s.run.stores, s.run.items.length);
-  for (const [w, info] of Object.entries(s.run.workers)) { ensureTile(+w); setLabel(+w, info.store, info.label); }
-  for (const f of s.frames) setFrame(f.worker, f.data);
-  for (const l of s.run.log) addLog(l);
-  for (const r of s.run.results) applyResult(r);
-  if (s.run.state === "stopped") endLive("Stopped. No more actions will be taken.");
-  else if (s.run.state === "failed") endLive("The search couldn't run.", true);
-  else if (s.report) { endLive("Done! Here's what I found."); renderReport(s.report); }
-  else if (s.run.state === "finished") setStatus("Search finished. Checking the matches…");
-  else setStatus("Searching…");
 }
 
 function initStores(stores, nItems) {
@@ -261,13 +282,17 @@ function updateCard(slug) {
 
 function ensureTile(w) {
   if (state.tiles[w]) return state.tiles[w];
-  const tile = el("div", "tile"), label = el("div", "label", "Starting…"), img = document.createElement("img");
-  img.alt = `Browser ${w + 1}`;
-  tile.append(label, img); $("grid").append(tile);
-  return (state.tiles[w] = { label, img });
+  const tile = el("div", "tile"), label = el("div", "label", "Starting…"), screen = el("div", "screen");
+  // The store page the agent is reading, sandboxed (no scripts, no clicks) and scaled down to the tile.
+  const frame = document.createElement("iframe");
+  frame.title = `Agent ${w + 1} view`; frame.setAttribute("sandbox", ""); frame.tabIndex = -1;
+  screen.append(frame); tile.append(label, screen); $("grid").append(tile);
+  const fit = () => { frame.style.transform = `scale(${screen.clientWidth / 900})`; };
+  new ResizeObserver(fit).observe(screen); fit();
+  return (state.tiles[w] = { label, frame });
 }
 function setLabel(w, store, text) { ensureTile(w).label.textContent = store ? `${store}: ${text}` : text; }
-function setFrame(w, b64) { ensureTile(w).img.src = "data:image/jpeg;base64," + b64; }
+function setView(w, html) { ensureTile(w).frame.srcdoc = html; }
 
 function addLog(e) {
   const log = $("log"), t = new Date((e.ts || Date.now() / 1000) * 1000).toLocaleTimeString();
@@ -295,13 +320,13 @@ function endLive(text, isError) {
   state.live = false; setStatus(text);
   $("stop-btn").disabled = true; $("approve-btn").disabled = false;
   if (isError) showError(text);
-  if (state.ws) { state.ws.onclose = null; }
+  state.abort = null;
   for (const t of Object.values(state.tiles)) if (/…$|^Ready/.test(t.label.textContent)) t.label.textContent = t.label.textContent.replace(/…$/, "") + (text.startsWith("Stopped") ? " (stopped)" : "");
 }
 
 $("stop-btn").addEventListener("click", async () => {
   $("stop-btn").disabled = true; $("stop-btn").textContent = "Stopping…";
-  try { await post("/api/runs/stop", {}); } catch (err) { showError(err.message); }
+  if (state.abort) state.abort.abort();  // closing the stream stops this visitor's agents on the server
 });
 
 // ---------------------------------------------------------------- 6. results
@@ -312,7 +337,7 @@ function renderReport(report) {
   show("step-results");
   renderMethod("method-results");
   renderResults();
-  if (fresh) loadIdeas();
+  if (fresh) { $("ideas").replaceChildren(); $("ideas-btn").disabled = false; }
 }
 
 const pickOf = item => item.options[state.pick[item.ingredient] || 0];
@@ -452,13 +477,16 @@ function renderLeftovers() {
 // to the idea generator (they still show in the leftovers list above).
 const SEASONINGS = new Set(["salt", "baking powder", "baking soda", "vanilla extract", "cinnamon", "yeast"]);
 
+// Asked only when the visitor clicks (each suggestion is a model call).
+$("ideas-btn").addEventListener("click", loadIdeas);
+
 async function loadIdeas() {
   const all = currentLeftovers(); $("ideas").replaceChildren();
   if (!all.length) return;
   const main = all.filter(({ item }) => !SEASONINGS.has(item.ingredient));
   const lo = main.length ? main : all;
   state.leftoverNames = all.map(({ item }) => item.ingredient);
-  const box = $("ideas"); box.append(el("p", "muted", "Thinking of ideas…"));
+  const box = $("ideas"); box.append(el("p", "muted", "Thinking of ideas…")); $("ideas-btn").disabled = true;
   try {
     const { ideas } = await post("/api/leftover-ideas", {
       leftovers: lo.slice(0, 8).map(({ item, p }) => ({ name: item.ingredient, amount: p.leftover_amount, unit: p.leftover_unit })),
@@ -473,7 +501,10 @@ async function loadIdeas() {
       b.onclick = () => startLeftoverSearch(idea);
       card.append(text, b); box.append(card);
     }
-  } catch (err) { box.replaceChildren(el("p", "muted", "Couldn't get recipe ideas right now: " + err.message)); }
+  } catch (err) {
+    box.replaceChildren(err instanceof LimitError ? "" : el("p", "muted", "Couldn't get recipe ideas right now: " + err.message));
+    $("ideas-btn").disabled = false;
+  }
 }
 
 // One tap: new recipe, with the leftovers pre-marked as already owned, straight to the checklist.

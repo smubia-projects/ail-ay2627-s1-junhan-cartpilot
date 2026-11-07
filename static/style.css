@@ -89,7 +89,9 @@ button.small { padding: .3rem .7rem; font-size: .85rem; }
 .tile { background: #0f172a; border-radius: 12px; overflow: hidden; display: flex; flex-direction: column; box-shadow: 0 10px 24px -10px #0f172a88; border: 1px solid #1e293b; }
 .tile .label { color: #e2e8f0; font-size: .82rem; padding: .45rem .7rem .45rem 2.9rem; background: #1e293b; min-height: 2.2rem; position: relative; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tile .label::before { content: ""; position: absolute; left: .7rem; top: 50%; width: 9px; height: 9px; margin-top: -4.5px; border-radius: 50%; background: #f87171; box-shadow: 14px 0 0 #fbbf24, 28px 0 0 #4ade80; }
-.tile img { width: 100%; aspect-ratio: 3 / 2; object-fit: cover; background: #334155; display: block; }
+.tile .screen { position: relative; width: 100%; aspect-ratio: 3 / 2; overflow: hidden; background: #334155; }
+/* The store page renders at 900x600 (like the original browser viewport) and is scaled down to the tile. */
+.tile iframe { position: absolute; top: 0; left: 0; width: 900px; height: 600px; border: 0; background: #fff; transform-origin: 0 0; pointer-events: none; }
 .log { background: #0b1220; color: #cbd5e1; font: .78rem/1.6 ui-monospace, Menlo, monospace; padding: .8rem 1rem; border-radius: 12px; max-height: 260px; overflow: auto; }
 .log div.blocked { color: #fca5a5; font-weight: 700; } .log div.error { color: #fcd34d; } .log .ts { color: #64748b; }
 
@@ -160,3 +162,7 @@ button.chip:hover { background: #e0e7ff; transform: translateY(-1px); }
   section { padding: 1.1rem; }
   .pick { grid-template-columns: 1fr; } .pick .price, .pick .meta:nth-child(even) { text-align: left; }
 }
+
+.small { font-size: .8rem; }
+footer.lodge { margin: 2rem 0 1rem; text-align: center; font-size: .82rem; color: #64748b; }
+footer.lodge a { color: inherit; }

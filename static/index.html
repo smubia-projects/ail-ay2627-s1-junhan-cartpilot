@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>CartPilot</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <main>
@@ -59,6 +59,7 @@
       <div id="method-ingredients"></div>
       <h3>Check your fridge</h3>
       <p class="muted">Upload or take a photo of your fridge/pantry. We only look for the ingredients above.</p>
+      <p class="note">Your photo is sent to an AI model to check for these ingredients. It is not stored. Avoid photos with people or personal details in them.</p>
       <input id="photo" type="file" accept="image/*">
       <img id="preview" alt="Your photo" hidden>
       <p><button id="scan-btn" disabled>Scan photo</button>
@@ -87,7 +88,8 @@
       <p id="live-status" class="muted">Starting…</p>
       <div class="progress"><div id="progress-bar"></div></div>
       <div id="store-cards" class="store-cards"></div>
-      <div id="grid" class="grid-live" aria-label="Live browser views"></div>
+      <div id="grid" class="grid-live" aria-label="Live agent views"></div>
+      <p class="muted small">Each tile shows the store page an agent is reading. The three stores are mock shops built for this demo.</p>
       <h3>Activity log</h3>
       <div id="log" class="log" aria-live="polite"></div>
     </section>
@@ -118,9 +120,18 @@
       <h2>🍽️ Leftovers</h2>
       <p class="muted">You'll have more than you need of these. Here are some ideas to use them up.</p>
       <ul id="leftover-list" class="leftovers"></ul>
+      <p><button id="ideas-btn" class="secondary">✨ Suggest recipes for my leftovers</button></p>
       <div id="ideas"></div>
     </section>
+    <footer class="lodge">
+      Built by Saw Jun Han at the AI Lodge hackathon ·
+      <a href="https://www.smubia.com/ailodge" target="_blank" rel="noopener noreferrer">Join AI Lodge</a> ·
+      <a href="https://www.smubia.com/Projects" target="_blank" rel="noopener noreferrer">Explore other projects</a> ·
+      <a href="https://github.com/smubia-projects/ail-ay2627-s1-junhan-cartpilot" target="_blank" rel="noopener noreferrer">View on GitHub</a>
+    </footer>
   </main>
-  <script src="/static/app.js"></script>
+  <script src="config.js"></script>
+  <script src="cta.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>
