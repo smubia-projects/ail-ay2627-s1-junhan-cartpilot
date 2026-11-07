@@ -1,22 +1,30 @@
-"""FastAPI entry point: all HTTP routes plus the /ws WebSocket for live updates."""
-import asyncio
-import json
-from pathlib import Path
+"""FastAPI entry point: the JSON API, the SSE stream for a live search run, and the 3 mock stores.
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
+API-only: the UI (static/) is deployed separately on Vercel and calls this API across origins.
+"""
+import json
+
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import TypeAdapter, ValidationError
 
 from app import ai, config
+from app.imaging import prepare_image
 from app.models import IngredientRequest, LeftoverRequest, RecipeRequest, RunRequest
-from app.runs import manager
+from app.rate_limit import check_rate_limit
+from app.runs import stream_run
 from app.units import canonical_name
 from mock_stores.server import router as mock_stores_router
 
-ROOT = Path(__file__).resolve().parent.parent
-
 app = FastAPI(title="CartPilot")
+app.add_middleware(CORSMiddleware, allow_origins=config.CORS_ORIGINS, allow_methods=["GET", "POST"],
+                   allow_headers=["Content-Type"])
+
+
+@app.get("/")
+def root():
+    return {"service": "ail-ay2627-s1-junhan-cartpilot", "health": "/api/health"}
 
 
 @app.get("/api/health")
@@ -29,21 +37,28 @@ def health():
         "status": "ok",
         "demo_mode": config.DEMO_MODE,
         "store_mode": config.STORE_MODE,
-        "model": config.GEMINI_MODEL,
-        "gemini_key_set": bool(config.GEMINI_API_KEY),
-        "headless": config.HEADLESS,
+        "model": config.MODEL_NAME,
+        "key_set": bool(config.API_KEY),
         "max_parallel": config.MAX_PARALLEL,
     }
 
 
 def _friendly(e: ai.AIError):
-    # status comes from the AIError (503 = AI problem, 400 = bad input); the frontend shows e.detail to the user as-is.
+    # status comes from the AIError (502 = AI problem, 501 = not configured, 400 = bad input);
+    # the frontend shows e.detail to the user as-is.
     return HTTPException(status_code=e.status, detail=str(e))
 
 
+def _limit(request: Request, bucket: str):
+    """Count one real model call. Demo mode (canned answers) makes none, so it is not limited."""
+    if not config.DEMO_MODE:
+        check_rate_limit(request, bucket)
+
+
 @app.post("/api/recipes")
-async def recipes(req: RecipeRequest):
+async def recipes(req: RecipeRequest, request: Request):
     """Step 2a: goal + servings -> 2-3 recipe options to pick from."""
+    _limit(request, "plan")
     try:
         return await ai.suggest_recipes(req.goal, req.servings)
     except ai.AIError as e:
@@ -51,8 +66,9 @@ async def recipes(req: RecipeRequest):
 
 
 @app.post("/api/ingredients")
-async def ingredients(req: IngredientRequest):
+async def ingredients(req: IngredientRequest, request: Request):
     """Step 2b: chosen recipe -> scaled ingredient list."""
+    _limit(request, "plan")
     try:
         result = await ai.generate_ingredients(req.goal, req.recipe_title, req.servings)
     except ai.AIError as e:
@@ -65,7 +81,7 @@ async def ingredients(req: IngredientRequest):
 
 
 @app.post("/api/fridge-scan")
-async def fridge_scan(image: UploadFile = File(...), ingredients: str = Form(...)):
+async def fridge_scan(request: Request, image: UploadFile = File(...), ingredients: str = Form(...)):
     """Step 3: photo + recipe ingredient names -> have/not-have + confidence per ingredient.
 
     Sent as multipart form data because it carries a file; `ingredients` is a JSON list of names.
@@ -77,80 +93,45 @@ async def fridge_scan(image: UploadFile = File(...), ingredients: str = Form(...
     if not names or len(names) > 60:
         raise HTTPException(status_code=400, detail="Ingredient list was empty or too long.")
     try:
-        return await ai.scan_fridge(await image.read(), names)
+        jpeg = prepare_image(await image.read())  # a bad photo is rejected before it costs a model call
+        _limit(request, "scan")
+        return await ai.scan_fridge(jpeg, names)
     except ai.AIError as e:
         raise _friendly(e)
 
 
-# ---------------------------------------------------------------- browser agent runs
-@app.post("/api/runs")
-async def start_run(req: RunRequest, request: Request):
-    """Start the browser agents. Only works if the user clicked Approve (approved=true)."""
+# ---------------------------------------------------------------- agent search runs
+@app.post("/api/runs/stream")
+async def run_stream(req: RunRequest, request: Request):
+    """Start the agents for THIS visitor and stream every event as Server-Sent Events.
+
+    Only works if the user clicked Approve (approved=true). Closing the stream (the Stop button)
+    stops the agents. The run ends with one AI double-check of the matches, so it is limited.
+    """
     if not req.approved:
         raise HTTPException(status_code=400, detail="Searching only starts after you approve the list.")
-    if manager.running:
-        raise HTTPException(status_code=409, detail="A search is already running. Stop it first.")
     if config.STORE_MODE != "mock":
         raise HTTPException(status_code=501, detail="Only mock-store mode is supported (real stores were deliberately left out; see the README).")
-    # The agent's browsers visit this same server, so use the address the user reached us at.
-    run = manager.start(req.items, str(request.base_url))
-    return {"run_id": run.id}
+    _limit(request, "search")
+    # Product links point at this server's /stores pages, so use the address the visitor reached us at.
+    events = stream_run(req.items, str(request.base_url), review=not config.DEMO_MODE)
 
+    async def sse():
+        async for event in events:
+            yield f"data: {json.dumps(event)}\n\n"
 
-@app.post("/api/runs/stop")
-async def stop_run():
-    """The Stop button: halts every agent immediately."""
-    manager.stop()
-    return {"stopped": True}
-
-
-@app.get("/api/runs/current")
-async def current_run():
-    if not manager.run:
-        raise HTTPException(status_code=404, detail="No search has been started.")
-    return manager.snapshot_event()
-
-
-@app.websocket("/ws")
-async def live(ws: WebSocket):
-    """Live feed for the UI: a snapshot on connect, then every agent event as it happens."""
-    await ws.accept()
-    q = manager.hub.subscribe()
-    try:
-        await ws.send_json(manager.snapshot_event())
-
-        async def pump():
-            while True:
-                await ws.send_json(await q.get())
-
-        sender = asyncio.create_task(pump())
-        receiver = asyncio.create_task(ws.receive_text())  # only here to notice the browser disconnecting
-        await asyncio.wait({sender, receiver}, return_when=asyncio.FIRST_COMPLETED)
-        for t in (sender, receiver):
-            t.cancel()
-            try:
-                await t
-            except (asyncio.CancelledError, WebSocketDisconnect, RuntimeError):
-                pass
-    except WebSocketDisconnect:
-        pass
-    finally:
-        manager.hub.unsubscribe(q)
+    return StreamingResponse(sse(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.post("/api/leftover-ideas")
-async def leftover_ideas(req: LeftoverRequest):
+async def leftover_ideas(req: LeftoverRequest, request: Request):
     """Step 9: biggest leftovers -> 2-3 simple recipes that use them."""
+    _limit(request, "plan")
     try:
         return await ai.suggest_leftover_ideas(req.leftovers, req.servings, req.exclude)
     except ai.AIError as e:
         raise _friendly(e)
 
 
-app.include_router(mock_stores_router)  # the 3 fake grocery sites at /stores/...
-app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
-
-
-@app.get("/")
-def index():
-    return FileResponse(ROOT / "static" / "index.html")
+app.include_router(mock_stores_router)  # the 3 fake grocery sites at /stores/... (the agents' product links)
