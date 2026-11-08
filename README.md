@@ -200,8 +200,8 @@ and restart. **Never put your key in `.env.example` or commit it.** (`.env` is g
 |---|---|---|
 | `API_BASE_URL` | `https://api.apiyi.com/v1` | OpenAI-compatible chat-completions gateway. |
 | `API_KEY` | – | Your key (old name `GEMINI_API_KEY` still works). Not needed in demo mode. |
-| `MODEL_NAME` | `deepseek-v4-flash` | Text model (old name `GEMINI_MODEL` still works). |
-| `VISION_MODEL_NAME` | `gemini-3.5-flash-lite` | Model for the fridge-photo scan (needs vision). |
+| `MODEL_NAME` | `deepseek-v4-1-flash-260910` | Text model (old name `GEMINI_MODEL` still works). |
+| `VISION_MODEL_NAME` | `deepseek-v4-1-flash-260910` | Model for the fridge-photo scan (needs vision). |
 | `DEMO_MODE` | `false` | `true` = canned AI answers, works offline (local development). |
 | `STORE_MODE` | `mock` | Only `mock` (the three built-in fake stores) is supported. |
 | `MAX_PARALLEL` | `4` | How many agents work at once in one run. |

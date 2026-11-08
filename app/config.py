@@ -26,8 +26,8 @@ def _first(*names: str, default: str = "") -> str:
 # Any OpenAI-compatible chat-completions gateway (AI Lodge uses apiyi).
 API_BASE_URL: str = _first("API_BASE_URL", default="https://api.apiyi.com/v1").rstrip("/")
 API_KEY: str = _first("API_KEY", "GEMINI_API_KEY")
-MODEL_NAME: str = _first("MODEL_NAME", "GEMINI_MODEL", default="deepseek-v4-flash")
-VISION_MODEL_NAME: str = _first("VISION_MODEL_NAME", default="gemini-3.5-flash-lite")  # fridge-photo scan (deepseek has no vision)
+MODEL_NAME: str = _first("MODEL_NAME", "GEMINI_MODEL", default="deepseek-v4-1-flash-260910")
+VISION_MODEL_NAME: str = _first("VISION_MODEL_NAME", default="deepseek-v4-1-flash-260910")  # fridge-photo scan (v4.1 reads images)
 DEMO_MODE: bool = _bool("DEMO_MODE", False)  # true = canned AI answers, no model calls (local dev only)
 STORE_MODE: str = os.getenv("STORE_MODE", "mock")
 MAX_PARALLEL: int = int(os.getenv("MAX_PARALLEL", "4"))

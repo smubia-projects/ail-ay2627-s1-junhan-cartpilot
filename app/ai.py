@@ -74,6 +74,8 @@ async def call_json(prompt: str, schema: type[BaseModel], image: bytes | None = 
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": content}],
                 response_format={"type": "json_object"},  # "JSON mode"
                 temperature=0.4,
+                # DeepSeek thinks first by default; recipes took ~25 s with thinking on.
+                extra_body={"reasoning_effort": "none"} if "deepseek" in model else None,
             )
             text = resp.choices[0].message.content or ""
             return schema.model_validate_json(_strip_fences(text))
