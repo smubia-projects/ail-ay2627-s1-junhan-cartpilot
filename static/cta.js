@@ -11,7 +11,7 @@ const PROJECT_CTA = {
     'Want to build AI agents that run your errands and find the best price at every store? AI Lodge hands you a team, a deadline and a stage, and you bring the build.',
   programme: 'AI Lodge',
   programmeLink: 'https://www.smubia.com/ailodge',
-  showcaseLink: 'https://www.smubia.com/Projects',
+  showcaseLink: 'https://www.smubia.com/projects',
   githubLink: 'https://github.com/smubia-projects/ail-ay2627-s1-junhan-cartpilot',
 };
 
